@@ -1,7 +1,8 @@
 package BloomFilter
 
 import (
-	// "sync"
+	"sync"
+	"sync/atomic"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -13,8 +14,20 @@ type BloomFilter struct {
 	size           uint64 // Size of the bits array
 	hashFuncsCount uint64
 
-	//	mu sync.Mutex // Mutex for thread-safe operations
+	mu sync.Mutex // Mutex for thread-safe operations
 }
+
+type Stats struct {
+	BitsTotal uint64 // Total number of bits in the filter
+	BitsSet uint64 // Number of bits set to 1 in the filter
+	ItemsCount uint64 // Number of items added to the filter
+	Density float64 // Density of the filter (ratio of bits set to total bits) 
+	ExpectedFPRate float64 // Expected false positive rate based on the number of items added and the size of the filter
+	ActualFPRate float64 // Actual false positive rate based on the number of items added and the size of the filter
+
+	HashFunctionsCount uint64 // Number of hash functions used in the filter
+}
+
 
 func validateParameters(expectedElements uint64, falsePositiveRate float64) error {
 	if expectedElements == 0 {
@@ -67,13 +80,19 @@ func (bf *BloomFilter) Count() uint64 {
 }
 
 func (bf *BloomFilter) Add(element string) {
+	bf.mu.Lock()
+	defer bf.mu.Unlock()
+
 	// get the hash positions for the element
 	positions := bf.getHashPositions(element)
 	for _, pos := range positions {
 		// set the bit at the position to 1
 		bf.setBit(pos)
 	}
-	bf.count++
+
+	// increment the count of elements added to the filter
+	// NOTE: Use atomic operation to safely increment the count in a concurrent environment
+	atomic.AddUint64(&bf.count, 1) 
 }
 
 func (bf *BloomFilter) getHashPositions(element string) []uint64 {
@@ -113,6 +132,9 @@ func (bf *BloomFilter) setBit(position uint64) {
 } 
 
 func (bf *BloomFilter) Check(element string) bool {
+	bf.mu.Lock()
+	defer bf.mu.Unlock()
+
 	positions := bf.getHashPositions(element)
 	for _, pos := range positions {
 		if !bf.isBitSet(pos) {
@@ -134,11 +156,41 @@ func (bf *BloomFilter) isBitSet(position uint64) bool {
 }
 
 func (bf *BloomFilter) Contains(element string) bool {
-	positions := bf.getHashPositions(element)
-	for _, pos := range positions {
-		if !bf.isBitSet(pos) {
-			return false
+	return bf.Check(element)
+}
+
+func (bf *BloomFilter) countBitsSet() uint64 {
+	count := uint64(0)
+
+	for pos := range int(bf.size) {
+		if bf.isBitSet(uint64(pos)) {
+			count++
 		}
 	}
-	return true
+
+	return count
+}
+
+func (bf *BloomFilter) Stats() Stats {
+	bitsSet := bf.countBitsSet()
+	var expectedFPRate float64
+
+	density := float64(bitsSet) / float64(bf.size)
+
+	if bf.count > 0 {
+		expectedFPRate = math.Pow(1-math.Exp(-float64(bf.hashFuncsCount)*float64(bf.count)/float64(bf.size)), float64(bf.hashFuncsCount))
+	}
+
+	actualFPRate := math.Pow(density, float64(bf.hashFuncsCount))
+
+	return Stats{
+		BitsTotal:          bf.size,
+		BitsSet:            bitsSet,
+		Density:            density,
+		ItemsCount:         bf.count,
+		ExpectedFPRate:     expectedFPRate,
+		ActualFPRate:       actualFPRate,
+		HashFunctionsCount: bf.hashFuncsCount,
+	}
+
 }
