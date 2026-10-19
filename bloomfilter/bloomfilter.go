@@ -102,6 +102,7 @@ func (bf *BloomFilter) getHashPositions(element string) []uint64 {
 	h1 := hash1(data)
 	h2 := hash2(data) | 1 // odd, so the sequence visits distinct positions
 
+	// Generate k hash positions using double hashing
 	for i := uint64(0); i < bf.hashFuncsCount; i++ {
 		positions[i] = (h1 + i*h2) % bf.size
 	}
