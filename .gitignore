@@ -1,0 +1,6 @@
+# Environment variables / secrets
+.env
+
+# Generated datasets (create with generator/main.go)
+data/words.txt
+data/test_words.txt

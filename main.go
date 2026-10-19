@@ -4,11 +4,16 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"math/rand"
 	"os"
 	"strings"
+	"time"
 
+	db "github.com/GergesHany/Bloom-Filters/DB"
 	"github.com/GergesHany/Bloom-Filters/bloomfilter"
+
+	"database/sql"
+
+	_ "github.com/lib/pq"
 )
 
 func readWords(path string) ([]string, error) {
@@ -29,85 +34,135 @@ func readWords(path string) ([]string, error) {
 	return words, scanner.Err()
 }
 
-func main() {
-	// 1. Define flags (returns a pointer to the value)
-	expectedUrlsCount := flag.Int("n", 1, "Number of elements")
-	FalsePositiveRate := flag.Float64("FP", 0.01, "False positive percentage")
-	wordsFilePath := flag.String("words", "data/words.txt", "Path to the words file")
-	wordsTestFilePath := flag.String("wordsTest", "data/test_words.txt", "Path to the words test file")
-
-	// 2. Parse the command-line flags
-	flag.Parse()
-
-	// 3. Print the values of the flags
-	fmt.Println("Number of elements:", *expectedUrlsCount)
-	fmt.Println("False positive percentage:", *FalsePositiveRate)
-	fmt.Println("Path to the words file:", *wordsFilePath)
-	fmt.Println("Path to the words test file:", *wordsTestFilePath)
-
-	bf := BloomFilter.New(uint64(*expectedUrlsCount), *FalsePositiveRate)
-
-	fmt.Println("Bloom Filter Size:", bf.Size())
-	fmt.Println("Number of Hash Functions:", bf.HashFuncsCount())
-
-	words, err := readWords(*wordsFilePath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "failed to read words file:", err)
-		os.Exit(1)
-	}
-
+func importDatasetToBloomFilter(bf *BloomFilter.BloomFilter, words []string) error {
 	for _, word := range words {
 		bf.Add(word)
 	}
+	return nil
+}
 
-	fmt.Println("Bloom Filter count of elements:", bf.Count())
-	fmt.Println("-----------------------------------------------------------")
-
-	// Test with random words taken from words.txt (already added, so they
-	// must all be reported as present — bloom filters have no false negatives).
-	sampleSize := 20
-	if sampleSize > len(words) {
-		sampleSize = len(words)
+func importDatasetToPostgres(datasetPath string, db *sql.DB, words []string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
 	}
-	fmt.Printf("Checking %d random words from %s:\n", sampleSize, *wordsFilePath)
-	found, missing := 0, 0
-	for _, idx := range rand.Perm(len(words))[:sampleSize] {
-		word := words[idx]
-		if bf.Contains(word) {
-			found++
-			fmt.Printf("%q -> exists\n", word)
-		} else {
-			missing++
-			fmt.Printf("%q -> NOT exists (false negative!)\n", word)
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("INSERT INTO words (word) VALUES ($1) ON CONFLICT DO NOTHING")
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %v", err)
+	}
+	defer stmt.Close()
+
+	for _, word := range words {
+		_, err := stmt.Exec(word)
+		if err != nil {
+			return fmt.Errorf("failed to insert word: %v", err)
 		}
 	}
-	fmt.Println("Found:", found, "| Missing:", missing)
-	fmt.Println("-----------------------------------------------------------")
 
+	return tx.Commit()
+}
+
+func benchmarkLookups(bf *BloomFilter.BloomFilter, testWords []string, runs int) (int, time.Duration) {
+	hits := 0
+	totalLookups := 0
+	start := time.Now()
+	for i := 0; i < runs; i++ {
+		for _, word := range testWords {
+			if bf.Contains(word) {
+				hits++
+			}
+			totalLookups++
+		}
+	}
+	duration := time.Since(start)
+	return hits, duration
+}
+
+func benchmarkPostgresLookups(db *sql.DB, testWords []string, runs int) (int, time.Duration, error) {
+	hits := 0
+	totalLookups := 0
+	start := time.Now()
+	for i := 0; i < runs; i++ {
+		for _, word := range testWords {
+			var exists bool
+			err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM words WHERE word = $1)", word).Scan(&exists)
+			if err != nil {
+				return 0, 0, fmt.Errorf("failed to query word: %v", err)
+			}
+			if exists {
+				hits++
+			}
+			totalLookups++
+		}
+	}
+	duration := time.Since(start)
+	return hits, duration, nil
+}
+
+func main() {
+	expectedElements := flag.Int("n", 1000, "Number of elements")
+	falsePositiveRate := flag.Float64("FP", 0.01, "False positive percentage")
+	wordsFilePath := flag.String("words", "data/words.txt", "Path to the words file")
+	wordsTestFilePath := flag.String("wordsTest", "data/test_words.txt", "Path to the words test file")
+	runs := flag.Int("runs", 100, "Number of lookup benchmark repetitions over the test set")
+
+	flag.Parse()
+
+	bf := BloomFilter.New(uint64(*expectedElements), *falsePositiveRate)
+
+	// Read the dataset once and load it into both stores
+	words, err := readWords(*wordsFilePath)
+	if err != nil {
+		fmt.Printf("Failed to read words file: %v\n", err)
+		return
+	}
+
+	if err := importDatasetToBloomFilter(bf, words); err != nil {
+		fmt.Printf("Failed to import dataset to Bloom Filter: %v\n", err)
+		return
+	}
+
+	// Connect to PostgreSQL
+	database, err := db.InitDB()
+	if err != nil {
+		fmt.Printf("Failed to connect to PostgreSQL: %v\n", err)
+		return
+	}
+	defer database.Close()
+
+	// Import dataset to PostgreSQL
+	if err := importDatasetToPostgres(*wordsFilePath, database, words); err != nil {
+		fmt.Printf("Failed to import dataset to PostgreSQL: %v\n", err)
+		return
+	}
+
+	// ----------------------------------------------------------------------------------------------------------------
+
+	// Benchmark lookups in Bloom Filter
 	testWords, err := readWords(*wordsTestFilePath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "failed to read test words file:", err)
-		os.Exit(1)
+		fmt.Printf("Failed to read test words file: %v\n", err)
+		return
 	}
 
-	// test_words.txt is disjoint from words.txt, so any word reported
-	// as present is a false positive and false negatives are impossible.
-	reportedPresent, reportedAbsent := 0, 0
-	for _, word := range testWords {
-		if bf.Contains(word) {
-			reportedPresent++
-		} else {
-			reportedAbsent++
-		}
-	}
+	testWords = append(testWords, words...)
 
-	fmt.Println("-----------------------------------------------------------")
-	stats := bf.Stats()
-	fmt.Println("Test words (not in the dataset):", len(testWords))
-	fmt.Println("False positives (reported present):", reportedPresent)
-	fmt.Println("Correct rejections (reported absent):", reportedAbsent)
-	fmt.Printf("Measured false positive rate: %.6f (%d/%d)\n",
-		float64(reportedPresent)/float64(len(testWords)), reportedPresent, len(testWords))
-	fmt.Printf("Theoretical false positive rate: %.6f (from n, FP params)\n", stats.ExpectedFPRate)
-	fmt.Printf("Density-based estimate: %.6f (bits-set density ^ hash count)\n", stats.ActualFPRate)
+	fmt.Println("Starting benchmark...")
+	fmt.Printf("Total words in dataset: %d\n", len(words))
+	fmt.Printf("Total words in test set: %d\n", len(testWords))
+	fmt.Printf("Number of runs for benchmarking: %d\n", *runs)
+
+
+	bfHits, bfDuration := benchmarkLookups(bf, testWords, *runs)
+	fmt.Printf("Bloom Filter: %d hits out of %d lookups in %v\n", bfHits, len(testWords)*(*runs), bfDuration)
+
+	// Benchmark lookups in PostgreSQL
+	pgHits, pgDuration, err := benchmarkPostgresLookups(database, testWords, *runs)
+	if err != nil {
+		fmt.Printf("Failed to benchmark PostgreSQL lookups: %v\n", err)
+		return
+	}
+	fmt.Printf("PostgreSQL: %d hits out of %d lookups in %v\n", pgHits, len(testWords)*(*runs), pgDuration)
 }
