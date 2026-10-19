@@ -65,3 +65,8 @@ The dataset is read once and loaded into both the Bloom filter and the
 `words` table. Lookups are then timed for each store and printed side by
 side, letting you compare the Bloom filter's speed against the extra false
 positives it reports relative to PostgreSQL.
+
+
+
+
+<img width="1152" height="136" alt="Screenshot From 2026-10-19 09-00-20" src="https://github.com/user-attachments/assets/ed665e85-f527-4611-914c-64de4bd698c5" />
